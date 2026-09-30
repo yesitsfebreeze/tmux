@@ -1894,3 +1894,44 @@ redraw_pane_scrollbar(struct client *c, struct window_pane *wp)
 {
 	redraw_draw(c, wp, REDRAW_PANE_SCROLLBAR);
 }
+
+/* Restore animation damage from the current scene, never from saved text. */
+void
+redraw_cursor_rows(struct client *c, u_int first, u_int last)
+{
+	struct redraw_scene *scene = redraw_get_scene(c);
+	struct redraw_draw_ctx dctx;
+	struct redraw_span *span;
+	struct window_pane *wp;
+	u_int y, cy, type, lines, start;
+
+	if (scene == NULL)
+		return;
+	redraw_set_draw_context(&dctx, scene);
+	tty_sync_start(&c->tty);
+	tty_update_mode(&c->tty, c->tty.mode & ~CURSOR_MODES, NULL);
+	for (y = 0; y < scene->sy; y++) {
+		cy = y + ((dctx.flags & REDRAW_STATUS_TOP) ? dctx.status_lines : 0);
+		if (cy < first || cy > last)
+			continue;
+		for (type = 0; type < REDRAW_SPAN_TYPES; type++) {
+			TAILQ_FOREACH(span, &scene->lines[y].spans[type], entry)
+				redraw_draw_span(&dctx, span, cy);
+		}
+	}
+	TAILQ_FOREACH(wp, &scene->w->panes, entry) {
+		if (window_pane_is_visible(wp))
+			redraw_draw_pane_prompt(&dctx, wp);
+	}
+	if (scene->w->menu != NULL)
+		redraw_draw_menu_lines(&dctx);
+	lines = dctx.status_lines;
+	if ((c->message_string != NULL || c->prompt != NULL) && lines == 0)
+		lines = 1;
+	start = (dctx.flags & REDRAW_STATUS_TOP) ? 0 : c->tty.sy - lines;
+	for (y = 0; y < lines; y++) {
+		if (start + y >= first && start + y <= last)
+			tty_draw_line(&c->tty, c->status.active, 0, y,
+			    c->tty.sx, 0, start + y, NULL);
+	}
+}

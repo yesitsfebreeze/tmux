@@ -362,6 +362,13 @@ const struct options_table_entry options_table[] = {
 	  .text = "Colour of the cursor."
 	},
 
+	{ .name = "cursor-smear",
+	  .type = OPTIONS_TABLE_FLAG,
+	  .scope = OPTIONS_TABLE_SESSION,
+	  .default_num = 0,
+	  .text = "Animate one cursor on the focused client."
+	},
+
 	{ .name = "cursor-style",
 	  .type = OPTIONS_TABLE_CHOICE,
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,

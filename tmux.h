@@ -2208,7 +2208,10 @@ struct prompt_draw_data {
 };
 
 /* Client connection. */
+struct cursor_smear;
+
 struct client {
+	struct cursor_smear	*cursor_smear;
 	const char		*name;
 	struct tmuxpeer		*peer;
 	const char		*user;
@@ -3642,6 +3645,7 @@ void	 screen_write_alternateoff(struct screen_write_ctx *,
 
 /* screen-redraw.c */
 void	 redraw_screen(struct client *);
+void	 redraw_cursor_rows(struct client *, u_int, u_int);
 void	 redraw_pane(struct client *, struct window_pane *);
 void	 redraw_pane_scrollbar(struct client *, struct window_pane *);
 void	 redraw_free_scene(struct redraw_scene *);
