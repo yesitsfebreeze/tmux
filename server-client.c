@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
+#include "cursor-smear-engine.h"
 
 static void	server_client_free(int, short, void *);
 static void	server_client_smear_free(struct client *);
@@ -3163,243 +3164,163 @@ server_client_report_theme(struct client *c, enum client_theme theme)
 	 */
 	tty_repeat_requests(&c->tty, 1);
 }
-/*
- * Client-owned cursor animation. Motion uses smear-cursor.nvim's normal-mode
- * tuning (17 ms, head .6, tail .45, anticipation .2, damping .85). The raster
- * is a Unicode quadrant approximation; it does not alter application grids.
- */
+
+/* Client lifecycle and terminal compositing; animation lives in the pinned engine. */
 struct cursor_smear {
-	struct event timer;
-	double point[4][2], target[4][2], velocity[4][2], stiffness[4];
-	u_int x, y, sx, sy, first, last;
-	int initialized, moving, due, painted;
-	enum screen_cursor_style shape;
+    struct event timer;
+    struct smear_engine *engine;
+    u_int sx, sy, first, last;
+    int initialized, painted, failed;
 };
 
 static void
-server_client_smear_timer(__unused int fd, __unused short what, void *arg)
+server_client_smear_timer(__unused int fd, __unused short what, __unused void *arg)
 {
-	struct client *c = arg;
-
-	c->cursor_smear->due = 1;
+    /* Waking the event loop runs server_client_reset_state with the new time. */
 }
 
 static void
 server_client_smear_free(struct client *c)
 {
-	if (c->cursor_smear == NULL)
-		return;
-	evtimer_del(&c->cursor_smear->timer);
-	free(c->cursor_smear);
-	c->cursor_smear = NULL;
-}
-
-/* Point-in-polygon works even while the spring temporarily folds the quad. */
-static int
-server_client_smear_contains(struct cursor_smear *a, double x, double y)
-{
-	int i, j, inside = 0;
-	double ax, ay, bx, by;
-
-	for (i = 0, j = 3; i < 4; j = i++) {
-		ax = a->point[i][0]; ay = a->point[i][1];
-		bx = a->point[j][0]; by = a->point[j][1];
-		if ((ay > y) != (by > y) &&
-		    x < (bx - ax) * (y - ay) / (by - ay) + ax)
-			inside = !inside;
-	}
-	return (inside);
+    if (c->cursor_smear == NULL)
+        return;
+    evtimer_del(&c->cursor_smear->timer);
+    smear_engine_free(c->cursor_smear->engine);
+    free(c->cursor_smear);
+    c->cursor_smear = NULL;
 }
 
 static void
-server_client_smear_draw(struct client *c, struct screen *s)
+server_client_smear_draw(struct client *c)
 {
-	struct cursor_smear *a = c->cursor_smear;
-	struct grid_cell gc = grid_default_cell;
-	/* bit order: upper left, upper right, lower left, lower right */
-	static const char *glyphs[] = {
-		" ", "▘", "▝", "▀", "▖", "▌", "▞", "▛",
-		"▗", "▚", "▐", "▜", "▄", "▙", "▟", "█"
-	};
-	double minx, maxx, miny, maxy;
-	int i, x, y, q, mask, xx, yy, hits;
-	int left, right, top, bottom;
+    struct cursor_smear *a = c->cursor_smear;
+    struct grid_cell gc = grid_default_cell;
+    const struct smear_cell *cell;
+    u_int i, x, y;
+    size_t size;
 
-	minx = maxx = a->point[0][0];
-	miny = maxy = a->point[0][1];
-	for (i = 1; i < 4; i++) {
-		minx = fmin(minx, a->point[i][0]);
-		maxx = fmax(maxx, a->point[i][0]);
-		miny = fmin(miny, a->point[i][1]);
-		maxy = fmax(maxy, a->point[i][1]);
-	}
-	left = fmax(0, floor(minx));
-	right = fmin(c->tty.sx - 1, floor(maxx));
-	top = fmax(0, floor(miny));
-	bottom = fmin(c->tty.sy - 1, floor(maxy));
-	gc.fg = s->ccolour;
-	if (gc.fg == -1 || gc.fg == 8)
-		gc.fg = s->default_ccolour;
-	if (gc.fg == -1 || gc.fg == 8)
-		gc.fg = 7;
-	tty_sync_start(&c->tty);
-	tty_update_mode(&c->tty, c->tty.mode & ~CURSOR_MODES, NULL);
-	for (y = top; y <= bottom; y++) {
-		for (x = left; x <= right; x++) {
-			mask = 0;
-			for (q = 0; q < 4; q++) {
-				hits = 0;
-				for (yy = 0; yy < 4; yy++) {
-					for (xx = 0; xx < 4; xx++) {
-						hits += server_client_smear_contains(a,
-						    x + (q % 2) * .5 + (xx + .5) / 8,
-						    y + (q / 2) * .5 + (yy + .5) / 8);
-					}
-				}
-				if (hits >= 2)
-					mask |= 1 << q;
-			}
-			if (mask == 0)
-				continue;
-			memset(&gc.data, 0, sizeof gc.data);
-			gc.data.size = gc.data.have = strlen(glyphs[mask]);
-			gc.data.width = 1;
-			memcpy(gc.data.data, glyphs[mask], gc.data.size);
-			tty_cursor(&c->tty, x, y);
-			tty_cell(&c->tty, &gc, NULL);
-			a->painted = 1;
-		}
-	}
-	a->first = top;
-	a->last = bottom;
+    a->first = c->tty.sy;
+    a->last = 0;
+    tty_sync_start(&c->tty);
+    tty_update_mode(&c->tty, c->tty.mode & ~CURSOR_MODES, NULL);
+    for (i = 0; i < smear_engine_count(a->engine); i++) {
+        cell = smear_engine_cell(a->engine, i);
+        if (cell->row < 1 || cell->col < 1 ||
+            cell->row > (int)c->tty.sy || cell->col > (int)c->tty.sx)
+            continue;
+        x = cell->col - 1; y = cell->row - 1;
+        gc.fg = cell->fg < 0 ? 8 : COLOUR_FLAG_RGB | cell->fg;
+        gc.bg = cell->bg < 0 ? redraw_cursor_background(c, x, y) :
+            COLOUR_FLAG_RGB | cell->bg;
+        size = strlen(cell->text);
+        memset(&gc.data, 0, sizeof gc.data);
+        gc.data.size = gc.data.have = size;
+        gc.data.width = 1;
+        memcpy(gc.data.data, cell->text, size);
+        tty_cursor(&c->tty, x, y);
+        tty_cell(&c->tty, &gc, NULL);
+        if (y < a->first) a->first = y;
+        if (y > a->last) a->last = y;
+        a->painted = 1;
+    }
 }
 
 static int
 server_client_smear(struct client *c, struct screen *s, int mode,
     u_int x, u_int y)
 {
-	struct cursor_smear *a = c->cursor_smear;
-	struct timeval tv = { .tv_usec = 17000 };
-	double distance[4], nearest, farthest, t, dx, dy, error, gain;
-	double width = 1, height = 1, top;
-	enum screen_cursor_style shape;
-	int i, j, enabled, changed;
-	struct window_pane *wp;
+    struct cursor_smear *a = c->cursor_smear;
+    struct smear_input input;
+    struct timeval tv;
+    struct timespec now;
+    enum screen_cursor_style shape;
+    int enabled, fg;
+    u_int ox, oy, sx, sy;
+    double delay;
+    struct window_pane *wp;
 
-	/* Match tty_cursor clamping (a prompt with status off uses row sy). */
-	if (c->tty.sx == 0 || c->tty.sy == 0)
-		return (mode);
-	if (x >= c->tty.sx)
-		x = c->tty.sx - 1;
-	if (y >= c->tty.sy)
-		y = c->tty.sy - 1;
-	top = y;
-
-	/* A pending sync frame must never be exposed by animation restoration. */
-	TAILQ_FOREACH(wp, &c->session->curw->window->panes, entry) {
-		if (wp->screen->mode & MODE_SYNC)
-			return (a != NULL && a->painted ? mode & ~MODE_CURSOR : mode);
-	}
-	enabled = options_get_number(c->session->options, "cursor-smear") &&
-	    (c->flags & CLIENT_FOCUSED) && (c->flags & CLIENT_UTF8) &&
-	    (mode & MODE_CURSOR) && s != NULL && x < c->tty.sx &&
-	    y < c->tty.sy && !(c->tty.flags & TTY_BLOCK) &&
-	    (!(c->tty.flags & TTY_FREEZE) || c->prompt != NULL) &&
-	    EVBUFFER_LENGTH(c->tty.out) < 65536;
-	if (a == NULL && !enabled) {
-		if (!(c->flags & CLIENT_FOCUSED) &&
-		    options_get_number(c->session->options, "cursor-smear"))
-			mode &= ~MODE_CURSOR;
-		return (mode);
-	}
-	if (a == NULL) {
-		a = c->cursor_smear = xcalloc(1, sizeof *a);
-		evtimer_set(&a->timer, server_client_smear_timer, c);
-	}
-	if (a->painted) {
-		redraw_cursor_rows(c, a->first, a->last);
-		a->painted = 0;
-	}
-	if (!enabled) {
-		evtimer_del(&a->timer);
-		a->initialized = a->moving = 0;
-		if (!(c->flags & CLIENT_FOCUSED) &&
-		    options_get_number(c->session->options, "cursor-smear"))
-			mode &= ~MODE_CURSOR;
-		return (mode);
-	}
-	shape = s->cstyle == SCREEN_CURSOR_DEFAULT ? s->default_cstyle : s->cstyle;
-	if (shape == SCREEN_CURSOR_BAR)
-		width = .125;
-	else if (shape == SCREEN_CURSOR_UNDERLINE) {
-		height = .125;
-		top += .875;
-	}
-	changed = !a->initialized || a->x != x || a->y != y || a->shape != shape;
-	if (changed) {
-		a->target[0][0] = a->target[3][0] = x;
-		a->target[1][0] = a->target[2][0] = x + width;
-		a->target[0][1] = a->target[1][1] = top;
-		a->target[2][1] = a->target[3][1] = top + height;
-	}
-	if (!a->initialized || a->sx != c->tty.sx || a->sy != c->tty.sy) {
-		memcpy(a->point, a->target, sizeof a->point);
-		memset(a->velocity, 0, sizeof a->velocity);
-		a->initialized = 1;
-		a->moving = 0;
-		a->sx = c->tty.sx; a->sy = c->tty.sy;
-		changed = 0;
-	}
-	if (changed) {
-		nearest = 1e20;
-		farthest = 0;
-		for (i = 0; i < 4; i++) {
-			dx = a->point[i][0] - x - width / 2;
-			dy = a->point[i][1] - top - height / 2;
-			distance[i] = sqrt(dx * dx + dy * dy);
-			nearest = fmin(nearest, distance[i]);
-			farthest = fmax(farthest, distance[i]);
-		}
-		for (i = 0; i < 4; i++) {
-			t = farthest == nearest ? 0 :
-			    (distance[i] - nearest) / (farthest - nearest);
-			a->stiffness[i] = .6 - .15 * t * t * t;
-			if (!a->moving) {
-				for (j = 0; j < 2; j++)
-					a->velocity[i][j] = .2 *
-					    (a->point[i][j] - a->target[i][j]);
-			}
-		}
-		a->moving = a->due = 1;
-	}
-	a->x = x; a->y = y; a->shape = shape;
-	if (!a->moving)
-		return (mode);
-	if (a->due) {
-		a->due = 0;
-		error = 0;
-		for (i = 0; i < 4; i++) {
-			gain = a->stiffness[i] / 1.375;
-			for (j = 0; j < 2; j++) {
-				a->velocity[i][j] +=
-				    (a->target[i][j] - a->point[i][j]) * gain;
-				a->point[i][j] += a->velocity[i][j];
-				a->velocity[i][j] *= .15;
-				error = fmax(error, fabs(a->velocity[i][j]));
-				error = fmax(error,
-				    fabs(a->target[i][j] - a->point[i][j]));
-			}
-		}
-		if (error < .1) {
-			a->moving = 0;
-			memcpy(a->point, a->target, sizeof a->point);
-			memset(a->velocity, 0, sizeof a->velocity);
-			evtimer_del(&a->timer);
-			return (mode);
-		}
-	}
-	server_client_smear_draw(c, s);
-	if (!evtimer_pending(&a->timer, NULL))
-		evtimer_add(&a->timer, &tv);
-	return (mode & ~MODE_CURSOR);
+    if (c->tty.sx == 0 || c->tty.sy == 0) return mode;
+    if (x >= c->tty.sx) x = c->tty.sx - 1;
+    if (y >= c->tty.sy) y = c->tty.sy - 1;
+    TAILQ_FOREACH(wp, &c->session->curw->window->panes, entry) {
+        if (wp->screen->mode & MODE_SYNC)
+            return a != NULL && a->painted ? mode & ~MODE_CURSOR : mode;
+    }
+    enabled = options_get_number(c->session->options, "cursor-smear") &&
+        (c->flags & CLIENT_FOCUSED) && (c->flags & CLIENT_UTF8) &&
+        (mode & MODE_CURSOR) && s != NULL && !(c->tty.flags & TTY_BLOCK) &&
+        (!(c->tty.flags & TTY_FREEZE) || c->prompt != NULL) &&
+        EVBUFFER_LENGTH(c->tty.out) < 65536;
+    if (a == NULL && !enabled) {
+        if (!(c->flags & CLIENT_FOCUSED) &&
+            options_get_number(c->session->options, "cursor-smear"))
+            mode &= ~MODE_CURSOR;
+        return mode;
+    }
+    if (a == NULL) {
+        a = c->cursor_smear = xcalloc(1, sizeof *a);
+        evtimer_set(&a->timer, server_client_smear_timer, c);
+        a->engine = smear_engine_new();
+        if (a->engine == NULL) a->failed = 1;
+    }
+    if (a->painted) {
+        redraw_cursor_rows(c, a->first, a->last);
+        a->painted = 0;
+    }
+    if (!enabled || a->failed) {
+        evtimer_del(&a->timer);
+        a->initialized = 0;
+        if (!(c->flags & CLIENT_FOCUSED) &&
+            options_get_number(c->session->options, "cursor-smear"))
+            mode &= ~MODE_CURSOR;
+        return mode;
+    }
+    memset(&input, 0, sizeof input);
+    shape = s->cstyle == SCREEN_CURSOR_DEFAULT ? s->default_cstyle : s->cstyle;
+    input.mode = shape == SCREEN_CURSOR_BAR ? 'i' :
+        (shape == SCREEN_CURSOR_UNDERLINE ? 'R' : 'n');
+    input.row = y + 1; input.col = x + 1;
+    input.realtime = 1;
+    input.width = c->tty.sx; input.height = c->tty.sy;
+    input.reset = !a->initialized || a->sx != c->tty.sx || a->sy != c->tty.sy;
+    wp = c->session->curw->window->active;
+    input.win = input.buf = wp == NULL ? 0 : wp->id;
+    input.top = input.line = 1;
+    input.winheight = c->tty.sy;
+    fg = c->tty.fg;
+    if (fg == -1 || fg == 8) fg = 7;
+    input.fg = colour_force_rgb(fg) & 0xffffff;
+    input.bg = -1; /* Match a transparent Normal highlight. */
+    if (wp != NULL && wp->smear_editor && wp->screen == &wp->base && wp->prompt == NULL &&
+        c->prompt == NULL && c->session->curw->window->menu == NULL) {
+        input.mode = wp->smear_mode;
+        input.fg = wp->smear_fg; input.bg = wp->smear_bg;
+        input.win = wp->smear_win; input.buf = wp->smear_buf;
+        input.top = wp->smear_top; input.line = wp->smear_line;
+        input.scroll = wp->smear_scroll;
+        tty_window_offset(&c->tty, &ox, &oy, &sx, &sy);
+        input.origin = (int)wp->yoff - (int)oy + wp->smear_origin;
+        if (status_at_line(c) == 0) input.origin += status_line_size(c);
+        input.winheight = wp->smear_height;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    input.now = now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0;
+    if (smear_engine_step(a->engine, &input) != 0) {
+        log_debug("cursor smear: %s", smear_engine_error(a->engine));
+        a->failed = 1;
+        evtimer_del(&a->timer);
+        return mode;
+    }
+    a->initialized = 1; a->sx = c->tty.sx; a->sy = c->tty.sy;
+    if (smear_engine_count(a->engine) != 0) server_client_smear_draw(c);
+    delay = smear_engine_delay(a->engine);
+    evtimer_del(&a->timer);
+    if (delay >= 0) {
+        if (delay < 1) delay = 1;
+        if (delay > 1000) delay = 1000;
+        tv.tv_sec = (int)delay / 1000;
+        tv.tv_usec = ((int)(delay * 1000)) % 1000000;
+        evtimer_add(&a->timer, &tv);
+    }
+    return smear_engine_hidden(a->engine) ? mode & ~MODE_CURSOR : mode;
 }

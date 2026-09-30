@@ -302,6 +302,12 @@ if test "x$found_libevent" = xno; then
 	AC_MSG_ERROR("libevent not found")
 fi
 
+# The personal cursor renderer runs the pinned Neovim engine in-process.
+PKG_CHECK_MODULES([SMEAR_LUA], [luajit], [
+    AM_CPPFLAGS="$SMEAR_LUA_CFLAGS $AM_CPPFLAGS"
+    LIBS="$SMEAR_LUA_LIBS $LIBS"
+], [AC_MSG_ERROR([LuaJIT is required by this fork's cursor renderer])])
+
 # Look for yacc.
 AC_CHECK_PROG(found_yacc, $YACC, yes, no)
 if test "x$found_yacc" = xno; then

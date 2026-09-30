@@ -1428,6 +1428,11 @@ struct window_pane {
 	int		 active_border_gc_set;
 	struct grid_cell active_border_gc;
 
+	/* Optional editor metadata, delivered in the pane output stream. */
+	int smear_editor, smear_fg, smear_bg, smear_win, smear_buf;
+	int smear_top, smear_line, smear_scroll, smear_origin, smear_height;
+	char smear_mode;
+
 	int		 control_bg;
 	int		 control_fg;
 
@@ -3646,6 +3651,7 @@ void	 screen_write_alternateoff(struct screen_write_ctx *,
 /* screen-redraw.c */
 void	 redraw_screen(struct client *);
 void	 redraw_cursor_rows(struct client *, u_int, u_int);
+int	 redraw_cursor_background(struct client *, u_int, u_int);
 void	 redraw_pane(struct client *, struct window_pane *);
 void	 redraw_pane_scrollbar(struct client *, struct window_pane *);
 void	 redraw_free_scene(struct redraw_scene *);

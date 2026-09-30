@@ -1915,8 +1915,12 @@ redraw_cursor_rows(struct client *c, u_int first, u_int last)
 		if (cy < first || cy > last)
 			continue;
 		for (type = 0; type < REDRAW_SPAN_TYPES; type++) {
-			TAILQ_FOREACH(span, &scene->lines[y].spans[type], entry)
-				redraw_draw_span(&dctx, span, cy);
+			TAILQ_FOREACH(span, &scene->lines[y].spans[type], entry) {
+                if (type == REDRAW_SPAN_STATUS)
+                    redraw_draw_status_span(&dctx, span, span->x, cy, span->width);
+                else
+                    redraw_draw_span(&dctx, span, cy);
+            }
 		}
 	}
 	TAILQ_FOREACH(wp, &scene->w->panes, entry) {
@@ -1934,4 +1938,86 @@ redraw_cursor_rows(struct client *c, u_int first, u_int last)
 			tty_draw_line(&c->tty, c->status.active, 0, y,
 			    c->tty.sx, 0, start + y, NULL);
 	}
+}
+
+/* Transparent overlay glyphs inherit the composed cell's background. */
+int
+redraw_cursor_background(struct client *c, u_int x, u_int y)
+{
+    struct redraw_scene *scene = redraw_get_scene(c);
+    struct redraw_draw_ctx dctx;
+    struct redraw_span *span, *found = NULL;
+    struct screen *screen = NULL;
+    struct window_pane *wp = NULL;
+    struct grid_cell gc = grid_default_cell, selected, defaults;
+    struct tty_style_ctx style_ctx;
+    u_int px = x, py = y, type, lines, start;
+    enum pane_lines pane_lines;
+
+    if (scene == NULL) return 8;
+    memset(&style_ctx, 0, sizeof style_ctx);
+    style_ctx.defaults = &grid_default_cell;
+    redraw_set_draw_context(&dctx, scene);
+    lines = dctx.status_lines;
+    if ((c->prompt != NULL || c->message_string != NULL) && lines == 0) lines = 1;
+    start = (dctx.flags & REDRAW_STATUS_TOP) ? 0 : c->tty.sy - lines;
+    if (y >= start && y < start + lines) {
+        screen = c->status.active;
+        py = y - start;
+    } else {
+        if (dctx.flags & REDRAW_STATUS_TOP) {
+            if (y < dctx.status_lines) return 8;
+            y -= dctx.status_lines;
+        }
+        if (y >= scene->sy) return 8;
+        for (type = 0; type < REDRAW_SPAN_TYPES; type++) {
+            TAILQ_FOREACH(span, &scene->lines[y].spans[type], entry) {
+                if (x >= span->x && x < span->x + span->width) found = span;
+            }
+        }
+        if (found == NULL) return 8;
+        switch (found->data.type) {
+        case REDRAW_SPAN_PANE:
+            wp = found->data.p.wp;
+            screen = wp->screen;
+            px = found->data.p.px + x - found->x;
+            py = found->data.p.py;
+            tty_default_colours(&defaults, wp, &style_ctx.dim);
+            style_ctx.defaults = &defaults;
+            style_ctx.palette = &wp->palette;
+            break;
+        case REDRAW_SPAN_STATUS:
+            screen = &found->data.st.wp->status_screen;
+            px = found->data.st.offset + x - found->x; py = 0;
+            break;
+        case REDRAW_SPAN_MENU:
+            screen = menu_screen(found->data.m.md);
+            px = found->data.m.px + x - found->x; py = found->data.m.py;
+            break;
+        case REDRAW_SPAN_BORDER:
+            wp = redraw_get_pane_for_border_style(&dctx, found);
+            if (wp != NULL) window_pane_get_border_style(wp, c, &gc);
+            else redraw_get_default_border_style(&dctx, &gc, &pane_lines);
+            break;
+        case REDRAW_SPAN_EMPTY:
+            window_get_fill_cell(scene->w, 1, &gc);
+            break;
+        case REDRAW_SPAN_OUTSIDE:
+            window_get_fill_cell(scene->w, 0, &gc);
+            break;
+        default:
+            break;
+        }
+    }
+    if (screen != NULL) {
+        grid_view_get_cell(screen->grid, px, py, &gc);
+        while (px > 0 && (gc.flags & GRID_FLAG_PADDING))
+            grid_view_get_cell(screen->grid, --px, py, &gc);
+        if (screen_check_selection(screen, px, py) && screen_select_cell(screen, &selected, &gc))
+            gc = selected;
+    }
+    /* Resolve palette/default/reverse attributes through the normal tty path. */
+    gc.link = 0;
+    tty_attributes(&c->tty, &gc, &style_ctx);
+    return (c->tty.cell.attr & GRID_ATTR_REVERSE) ? c->tty.cell.fg : c->tty.cell.bg;
 }

@@ -932,6 +932,7 @@ input_reset(struct input_ctx *ictx, int clear)
 	input_reset_cell(ictx);
 
 	if (clear && wp != NULL) {
+		wp->smear_editor = 0;
 		if (TAILQ_EMPTY(&wp->modes))
 			screen_write_start_pane(sctx, wp, &wp->base);
 		else
@@ -1969,9 +1970,11 @@ input_csi_dispatch_rm_private(struct input_ctx *ictx)
 		case 47:
 		case 1047:
 			screen_write_alternateoff(sctx, gc, 0);
+			if (ictx->wp != NULL) ictx->wp->smear_editor = 0;
 			break;
 		case 1049:
 			screen_write_alternateoff(sctx, gc, 1);
+			if (ictx->wp != NULL) ictx->wp->smear_editor = 0;
 			break;
 		case 2004:
 			screen_write_mode_clear(sctx, MODE_BRACKETPASTE);
@@ -2692,6 +2695,47 @@ input_enter_osc(struct input_ctx *ictx)
 	ictx->flags &= ~INPUT_LAST;
 }
 
+/* Editor metadata is numeric, pane-local and never evaluated as a command. */
+static void
+input_osc_smear(struct input_ctx *ictx, const char *p)
+{
+    struct window_pane *wp = ictx->wp;
+    char *copy, *next, *field;
+    const char *error;
+    long long values[9];
+    int i;
+    char mode;
+
+    if (wp == NULL || strncmp(p, "smear-v1;", 9) != 0) return;
+    p += 9;
+    if (strcmp(p, "off") == 0) { wp->smear_editor = 0; return; }
+    mode = *p++;
+    if (mode == 0 || strchr("niRct", mode) == NULL || *p++ != ';') return;
+    copy = next = xstrdup(p);
+    for (i = 0; i < 9; i++) {
+        field = strsep(&next, ";");
+        if (field == NULL) { free(copy); return; }
+        values[i] = strtonum(field, -16777215, 2147483647, &error);
+        if (error != NULL) { free(copy); return; }
+    }
+    if (next != NULL) { free(copy); return; }
+    free(copy);
+    if (values[0] < 0 || values[0] > 0xffffff ||
+        values[1] < -1 || values[1] > 0xffffff || values[2] < 0 ||
+        values[3] < 0 || values[4] < 1 || values[5] < 1 ||
+        values[7] < 0 || values[7] >= screen_size_y(&wp->base) ||
+        values[8] < 1 || values[8] > screen_size_y(&wp->base) ||
+        values[6] < -(long long)screen_size_y(&wp->base) ||
+        values[6] > screen_size_y(&wp->base)) return;
+    wp->smear_mode = mode;
+    wp->smear_fg = values[0]; wp->smear_bg = values[1];
+    wp->smear_win = values[2]; wp->smear_buf = values[3];
+    wp->smear_top = values[4]; wp->smear_line = values[5];
+    wp->smear_scroll = values[6];
+    wp->smear_origin = values[7]; wp->smear_height = values[8];
+    wp->smear_editor = 1;
+}
+
 /* OSC terminator (ST) received. */
 static void
 input_exit_osc(struct input_ctx *ictx)
@@ -2766,6 +2810,9 @@ input_exit_osc(struct input_ctx *ictx)
 		break;
 	case 112:
 		input_osc_112(ictx, p);
+		break;
+	case 777:
+		input_osc_smear(ictx, p);
 		break;
 	case 133:
 		input_osc_133(ictx, p);

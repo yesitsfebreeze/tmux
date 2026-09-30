@@ -23,29 +23,52 @@ cells never enter pane grids or scrollback. Damaged rows are restored from
 the current composed scene, including borders, floating panes and status;
 an application redraw cannot make a saved text snapshot overwrite new text.
 
-Motion uses the normal-mode spring parameters from smear-cursor.nvim:
-17 ms frames, head stiffness .6, tail stiffness .45, anticipation .2,
-damping .85. Rasterization currently uses Unicode quadrant blocks. This is
-not a pixel-identical port of that plugin's legacy diagonal glyphs, shading,
-or mode-specific motion. Using this one renderer for every application gives
-them consistent motion, but visual comparison with the original remains open.
+The animation is the original smear-cursor.nvim engine, pinned at
+`9e9378d6ee34bb3782e0e8c63d9ec8ca618b479b` with
+`legacy_computing_symbols_support = true`, matching the installed Neovim
+configuration. The unchanged upstream Lua modules provide diagonal/eighth
+blocks, gradient/gamma, volume reduction, maximum trail length, elapsed-time
+correction, debounce and mode-specific damping. LuaJIT runs them inside tmux;
+there is no per-frame subprocess or runtime Lua-file loading.
 
-Do not run an application-side cursor animation at the same time. Neovim's
-plugin can check the inherited option with `tmux show-options -Av cursor-smear`;
-keep the plugin only if the command fails or does not return `on`. Restart
-existing Neovim processes after changing which renderer owns the cursor.
+The parity test compares the embedded engine against the pinned modules
+running separately in Neovim. It checks emitted coordinates, glyphs, RGB
+colours, visibility and next-frame timing across 673 deterministic frames,
+including all directions, insertion, replace/command modes, retargeting,
+window switching, scrolling, clipping and delayed frames. Actual wall-clock
+presentation still depends on terminal rendering and scheduling.
+
+For exact editor semantics, copy `examples/smear-tmux.lua` to Neovim's
+`lua/config/smear-tmux.lua` and use `examples/smear-cursor.nvim.lua` as the lazy
+plugin spec. The bridge requires Neovim 0.12's `nvim_ui_send`; it sends
+pane-local numeric metadata via `OSC 777;smear-v1` (mode, Cursor/Normal
+colours, window/buffer IDs and viewport scroll distance). This lets tmux
+follow editor modes rather than guess them from cursor shape. Metadata is
+ignored in copy mode and tmux prompts, and cleared on editor exit, terminal
+reset or leaving the alternate screen. Applications without metadata use
+block/vertical-bar/underline as normal/insert/replace respectively.
+
+The plugin condition checks `tmux show-options -Av cursor-smear`; Neovim's
+own renderer loads only when tmux does not own the cursor. Restart existing
+Neovim processes after changing ownership. Transparent trail cells preserve
+the current composed background, including coloured text and selections.
+
+The vendored modules are GPL-3.0; their license and source hashes are in
+`vendor/smear-cursor/`. Original tmux notices are retained.
 
 Disable with `set -g cursor-smear off`; the old overlay is restored and the
 ordinary terminal cursor resumes. The default is off.
 
 ## Build and verify
 
-Use the regular tmux build prerequisites and configure flags for your host:
+Use the regular tmux prerequisites plus LuaJIT and pkg-config. LuaJIT is
+already a dependency of Homebrew Neovim on this machine. On macOS:
 
 ```sh
 sh autogen.sh
-./configure --prefix="$HOME/.local/opt/tmux-next"
+./configure --prefix="$HOME/.local/opt/tmux-next" --enable-utf8proc --enable-jemalloc
 make -j4
+python3 regress/cursor-smear-parity.py
 python3 regress/cursor-smear.py
 make install
 ```
@@ -56,7 +79,9 @@ frames, cursor visibility, Unicode text restoration, inactive panes, focus,
 copy mode, command prompts, resizing and disabling the renderer. It kills only those test servers.
 `TEST_TMUX_OUTER` optionally selects another tmux binary for the outer server.
 `SMEAR_NVIM_CONFIG` optionally names the Neovim plugin spec to test the handoff
-with a real headless Neovim process.
+with both headless Neovim and a real Neovim TUI. `SMEAR_ORIGINAL` can name
+a checkout of the original plugin to verify the vendored bytes against its
+pinned Git revision as well as the recorded hashes.
 
 Installing a binary does not replace an already-running tmux server. Existing
 sessions continue on the old executable until the server is restarted. Never

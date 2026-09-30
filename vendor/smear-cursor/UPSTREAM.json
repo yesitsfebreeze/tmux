@@ -1,0 +1,12 @@
+{
+  "url": "https://github.com/sphamba/smear-cursor.nvim",
+  "revision": "9e9378d6ee34bb3782e0e8c63d9ec8ca618b479b",
+  "sha256": {
+    "animation.lua": "7674381f54de27f5720e5797a323b4fe5bdeb1dd38dbdf5230c1d5ebfd1f3b5e",
+    "draw.lua": "dd0a4002a0ece2fcc1140fc174ee7e04d492027c721e5a678646a0684c29cb19",
+    "math.lua": "e69c9298896e0039e05355883528712a2ffc27c5218e4bebd8218f66a1b8163b",
+    "config.lua": "1268c1b08d303580a096ec9858cd4bac9b994d9e15452861c902d799daf8a954",
+    "color.lua": "0886e0b520b0d34a76e1cbd88e609cd5ddc7affceeb5d12504a242b5c95b6a02",
+    "events.lua": "232e21387556f9720e17efa4742cd58738b1fa393931b7205fefd7bb71d45f02"
+  }
+}

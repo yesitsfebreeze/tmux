@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real client renderer inside a second tmux terminal emulator."""
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -26,12 +27,34 @@ def capture():
 def key(pane, value):
     run(inner, 'send-keys', '-t', pane, '-l', value)
 
-def collect(duration=.5):
+def check_background(frame):
+    bg = None
+    for part in re.split(r'(\x1b\[[0-9;]*m)', frame):
+        if part.startswith('\x1b['):
+            codes = [int(n or 0) for n in part[2:-1].split(';')]
+            i = 0
+            while i < len(codes):
+                code = codes[i]
+                if code in (0, 49): bg = None
+                elif code == 48 and codes[i+1] == 2:
+                    bg = tuple(codes[i+2:i+5]); i += 4
+                elif code == 48 and codes[i+1] == 5:
+                    bg = ('index', codes[i+2]); i += 2
+                elif code == 38 and codes[i+1] == 2: i += 4
+                elif code == 38 and codes[i+1] == 5: i += 2
+                elif 40 <= code <= 47: bg = ('index', code-40)
+                i += 1
+        elif any(0x2580 <= ord(ch) <= 0x259f or 0x1fb00 <= ord(ch) <= 0x1fbff
+                 or ord(ch) in (0x25e2,0x25e3,0x25e4,0x25e5) for ch in part):
+            assert bg == (30,40,50), ('smear erased background',bg)
+
+def collect(duration=.5, background=False):
     end = time.monotonic() + duration
     frames = []
     flags = []
     while time.monotonic() < end:
         frames.append(capture())
+        if background: check_background(run(outer, 'capture-pane', '-e', '-p'))
         flags.append(run(outer, 'display-message', '-p', '#{cursor_flag}'))
         time.sleep(.01)
     return frames, flags
@@ -43,7 +66,7 @@ try:
 from shutil import get_terminal_size
 tty.setraw(0)
 w,h=get_terminal_size()
-os.write(1,b'\\x1b[2J')
+os.write(1,b'\\x1b[48;2;30;40;50m\\x1b[2J')
 for y in range(h):
     text=("a界ébcdefghijklmnopqrstuvwxyz"*10)[:max(1,w//2)]
     os.write(1,(f"\\x1b[{y+1};1H"+text).encode())
@@ -69,13 +92,13 @@ while True:
         baseline = capture()
         content = run(inner, 'capture-pane', '-p', '-t', p1)
         key(p1, 'm')
-        frames, flags = collect()
+        frames, flags = collect(background=True)
         assert any(frame != baseline for frame in frames), 'no visible animation'
         assert '0' in flags, 'physical cursor was not hidden during animation'
         assert capture() == baseline, 'trail damaged final terminal contents'
         assert flags[-1] == '1', 'physical cursor did not return'
         assert run(inner, 'capture-pane', '-p', '-t', p1) == content, 'application grid changed'
-        print('PASS: visible trail, one cursor, Unicode text restored, application grid untouched')
+        print('PASS: visible trail, one cursor, Unicode text and coloured backgrounds preserved, application grid untouched')
         for shape in ('b', 'u', 'c'):
             key(p1, shape)
             key(p1, 'n')
@@ -155,7 +178,7 @@ while True:
         print('PASS: resize cancels old coordinates without stale cells')
         if env.get('SMEAR_NVIM_CONFIG'):
             lua = Path(temp) / 'check.lua'
-            lua.write_text('local p=dofile(vim.env.SMEAR_NVIM_CONFIG); print(p[1].cond() and "fallback" or "tmux"); vim.cmd("qa!")')
+            lua.write_text('package.path=vim.fn.fnamemodify(vim.env.SMEAR_NVIM_CONFIG,":h:h").."/?.lua;"..package.path; local p=dofile(vim.env.SMEAR_NVIM_CONFIG); print(p[1].cond() and "fallback" or "tmux"); vim.cmd("qa!")')
             nvim_env = dict(env, PATH=str(Path(binary).parent) + os.pathsep + env.get('PATH', ''), TMUX=run(inner, 'display-message', '-p', '#{socket_path},#{pid},0'))
             def nvim_owner(environment):
                 result = subprocess.run(['nvim', '--headless', '-u', 'NONE', '-l', str(lua)], env=environment, text=True, capture_output=True, check=True)
@@ -165,6 +188,49 @@ while True:
             assert nvim_owner(nvim_env) == 'fallback'
             assert nvim_owner(env) == 'fallback'
             print('PASS: real Neovim disables its duplicate only when tmux owns the cursor')
+            # Exercise the bridge through a real TUI, deliberately holding the
+            # terminal shape at block so replace-mode detection needs metadata.
+            run(inner, 'set-option', '-g', 'cursor-smear', 'on')
+            config_root = Path(env['SMEAR_NVIM_CONFIG']).parents[2]
+            init = Path(temp) / 'nvim.lua'
+            init.write_text('vim.opt.rtp:prepend(' + repr(str(config_root)) + '); '
+                'vim.o.termguicolors=true; vim.o.laststatus=0; vim.o.showmode=false; '
+                'vim.o.ruler=false; vim.o.cmdheight=0; vim.o.guicursor="a:block"; '
+                'vim.api.nvim_set_hl(0,"Normal",{fg=0xd4be98,bg="NONE"}); '
+                'vim.api.nvim_set_hl(0,"Cursor",{bg=0xa9b665}); '
+                'require("config.smear-tmux").setup()')
+            document = Path(temp) / 'text'
+            document.write_text(('abcdefghijklmnopqrstuvwxyz' * 2 + '\n') * 100)
+            socket = str(Path(temp) / 'nvim.sock')
+            run(inner, 'new-window', shlex.join(['nvim', '--listen', socket, '-u', str(init), str(document)]))
+            def remote(*args):
+                return subprocess.run(['nvim', '--server', socket] + list(args), env=env,
+                    text=True, capture_output=True, check=True).stdout.strip()
+            deadline = time.monotonic() + 5
+            while not Path(socket).exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            time.sleep(.5)
+            editor_baseline = capture()
+            remote('--remote-expr', 'nvim_win_set_cursor(0,[12,45])')
+            frames, flags = collect()
+            assert '0' in flags, 'real Neovim normal motion did not animate'
+            assert capture() == editor_baseline, 'Neovim normal motion left residue'
+            remote('--remote-send', 'R')
+            collect()
+            assert remote('--remote-expr', 'mode(1)') == 'R'
+            remote('--remote-expr', 'nvim_win_set_cursor(0,[3,2])')
+            frames, flags = collect()
+            assert all(flag == '1' for flag in flags), 'replace mode ignored editor metadata'
+            assert all(frame == editor_baseline for frame in frames), 'replace mode should jump like upstream'
+            remote('--remote-send', '<Esc>i')
+            collect()
+            assert remote('--remote-expr', 'mode(1)') == 'i'
+            remote('--remote-expr', 'nvim_win_set_cursor(0,[14,45])')
+            frames, flags = collect()
+            assert '0' in flags, 'insert mode did not animate'
+            assert capture() == editor_baseline, 'insert mode left residue'
+            remote('--remote-send', '<Esc>:qa!<CR>')
+            print('PASS: real Neovim TUI reports modes through OSC; normal/insert animate and replace jumps')
 
 finally:
     run(outer, 'kill-server', check=False)

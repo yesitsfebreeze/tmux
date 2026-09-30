@@ -88,6 +88,9 @@ endif
 
 # List of sources.
 dist_tmux_SOURCES = \
+	cursor-smear-engine.c \
+	cursor-smear-engine.h \
+	cursor-smear-lua.h \
 	alerts.c \
 	arguments.c \
 	attributes.c \
@@ -293,3 +296,14 @@ install-exec-hook:
 # And uninstall it.
 uninstall-hook:
 	rm -f $(DESTDIR)$(mandir)/man1/tmux.1
+
+EXTRA_DIST += cursor-smear-host.lua tools/embed-cursor-smear.py \
+    vendor/smear-cursor/LICENSE vendor/smear-cursor/UPSTREAM.json \
+    vendor/smear-cursor/config.lua vendor/smear-cursor/math.lua \
+    vendor/smear-cursor/color.lua vendor/smear-cursor/draw.lua \
+    vendor/smear-cursor/animation.lua vendor/smear-cursor/events.lua
+
+EXTRA_DIST += vendor/smear-cursor/README.md README.fork.md \
+    examples/smear-tmux.lua examples/smear-cursor.nvim.lua \
+    regress/cursor-smear-engine.c regress/cursor-smear-oracle.lua \
+    regress/cursor-smear-parity.py regress/cursor-smear.py
